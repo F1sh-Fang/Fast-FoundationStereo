@@ -1,0 +1,7 @@
+FROM ffs:temp_base
+
+ENV TZ=US/Pacific
+ENV PATH="/opt/conda/envs/my/bin:$PATH"
+ENV OPENCV_IO_ENABLE_OPENEXR=1
+
+SHELL ["/bin/bash", "-c", "source ~/.bashrc && conda activate my"]

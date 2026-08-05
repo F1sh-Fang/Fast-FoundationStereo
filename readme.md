@@ -1,5 +1,8 @@
 # Fast-FoundationStereo: Real-Time Zero-Shot Stereo Matching
 
+> ROS2 + RealSense D405 + Docker/ZMQ 实时部署说明：
+> [docs/ros2_zmq_deployment_zh.md](docs/ros2_zmq_deployment_zh.md)
+
 This is the official implementation of our paper accepted to CVPR 2026
 
 [[Website]](https://nvlabs.github.io/Fast-FoundationStereo/) [[Paper]](https://arxiv.org/abs/2512.11130) [[Video]](https://www.youtube.com/watch?v=2BUYZojCzXE)
@@ -30,7 +33,10 @@ Stereo foundation models achieve strong zero-shot generalization but remain comp
 - Option 1: Docker
 ```bash
 docker build --network host -t ffs -f docker/dockerfile .
-bash docker/run_container.sh
+# First use: create a persistent named container and enter it.
+bash docker/1_create_container.sh
+# Later use: restart and enter the same container (installed packages persist).
+bash docker/2_start_container.sh
 ```
 
 - Option 2: pip
@@ -121,9 +127,16 @@ python scripts/make_single_onnx.py --model_dir weights/23-36-37/model_best_bp2_s
 | `--max_disp`      | Maximum disparity for volume encoding, 192 should be enough, unless you need to sense very near objects (e.g. <0.1m). Increasing it runs slower and uses more memory. |
 | `--onnx_name`     | Base name for the saved ONNX file (default: `fast_foundationstereo`)     |
 
-Then convert to a single TRT engine:
+For TensorRT 11.x, convert the graph to FP16 first (TensorRT 11 uses strongly
+typed networks and removed the legacy `trtexec --fp16` switch):
 ```bash
-trtexec --onnx=output/fast_foundationstereo.onnx --saveEngine=output/fast_foundationstereo.engine --fp16
+python scripts/convert_onnx_fp16.py \
+  --input output/fast_foundationstereo.onnx \
+  --output output/fast_foundationstereo_fp16.onnx \
+  --keep_io_types
+trtexec --onnx=output/fast_foundationstereo_fp16.onnx \
+  --saveEngine=output/fast_foundationstereo_fp16.engine \
+  --memPoolSize=workspace:4096 --skipInference
 ```
 
 To run inference with the single ONNX or TRT engine:
@@ -174,8 +187,8 @@ Refer to `scripts/make_onnx.py` for a comprehensive list of available flags.
 
 Then convert from ONNX to TRT:
 ```bash
-trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.engine --fp16  --useCudaGraph
-trtexec --onnx=output/post_runner.onnx --saveEngine=output/post_runner.engine --fp16  --useCudaGraph
+trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.engine --memPoolSize=workspace:4096
+trtexec --onnx=output/post_runner.onnx --saveEngine=output/post_runner.engine --memPoolSize=workspace:4096
 ```
 
 To use the two-stage TRT for inference:

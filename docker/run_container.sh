@@ -1,4 +1,11 @@
-docker rm -f ffs || true
-xhost +local:root || true
-DIR=$(pwd)/../
-docker run --gpus all --runtime nvidia --env NVIDIA_DISABLE_REQUIRE=1 -it --network=host --name ffs --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v $DIR:/workspace --ipc=host -e DISPLAY=${DISPLAY} -v /tmp/.X11-unix:/tmp/.X11-unix -v /tmp:/tmp -v /home:/home -v /mnt:/mnt ffs bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CONTAINER_NAME="${FFS_CONTAINER_NAME:-ffs}"
+
+if docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+  exec "${SCRIPT_DIR}/2_start_container.sh"
+else
+  exec "${SCRIPT_DIR}/1_create_container.sh"
+fi
