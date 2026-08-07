@@ -25,21 +25,15 @@ ENV OPENCV_IO_ENABLE_OPENEXR=1
 RUN conda init bash &&\
     echo "conda activate my" >> ~/.bashrc &&\
     conda activate my &&\
-    pip install uv -i https://mirrors.aliyun.com/pypi/simple/  &&\
-    uv pip install torch==2.6.0 torchvision==0.21.0 xformers==0.0.29.post3 --index-url https://download.pytorch.org/whl/cu124
+    pip install uv &&\
+    uv pip install torch==2.6.0 torchvision==0.21.0 xformers --index-url https://download.pytorch.org/whl/cu124
 
 COPY requirements.txt /tmp/requirements.txt
-# Keep modelopt out of the runtime image.  Its unconstrained "torch" extra can
-# silently replace the CUDA 12.4 torch/torchvision pair above with a newer ABI.
-# The resulting mismatch fails at import time with:
-#   RuntimeError: operator torchvision::nms does not exist
-# None of the inference or ONNX export scripts in this repository need it.
 RUN conda activate my &&\
-    uv pip install -r /tmp/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ &&\
-    uv pip install onnxruntime-gpu onnx onnxconverter-common pycuda cuda-python tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12 -i https://mirrors.aliyun.com/pypi/simple/ &&\
+    uv pip install -r /tmp/requirements.txt &&\
+    uv pip install onnxruntime-gpu onnx pycuda cuda-python tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12 nvidia-modelopt[torch] &&\
     conda install -y -c anaconda h5py &&\
-    conda install -y -c conda-forge libstdcxx-ng &&\
-    python -c "import torch, torchvision, zmq; assert torch.__version__.startswith('2.6.0'); print(torch.__version__, torchvision.__version__, zmq.__version__)"
+    conda install -y -c conda-forge libstdcxx-ng
 
 RUN cd / && wget https://developer.download.nvidia.com/compute/tensorrt/10.11.0/local_installers/nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9_1.0-1_amd64.deb &&\
     apt install -y ./nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9_1.0-1_amd64.deb &&\

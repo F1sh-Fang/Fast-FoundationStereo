@@ -1,0 +1,92 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ARG TRT_VERSION=10.11.0.33
+ARG TRT_DEB_VERSION=10.11.0.33-1+cuda12.9
+
+ENV TZ=US/Pacific
+ENV DEBIAN_FRONTEND=noninteractive
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# TensorRT is deliberately omitted here. It is installed from the pinned
+# NVIDIA 10.11 repository below so apt cannot silently select a newer release.
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
+      apt-utils build-essential ca-certificates cmake curl ffmpeg git \
+      libturbojpeg-dev pkg-config wget zstd \
+      libx11-xcb1 libxcb-xinerama0 libxcb-icccm4 libxcb-render-util0 \
+      libxcb-shape0 libxcb-keysyms1 libxcb-image0 libxkbcommon-x11-0 \
+      libxcb-cursor0 libxcb-xkb1 libxcb-render0 libxcb-shm0 libxcb-sync1 \
+      libxcb-xfixes0 libxcb-randr0 libxcb-xtest0 libsm6 libxext6 \
+      libxkbcommon0 && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+SHELL ["/bin/bash", "--login", "-c"]
+
+RUN cd / && \
+    wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /miniconda.sh && \
+    /bin/bash /miniconda.sh -b -p /opt/conda && \
+    rm -f /miniconda.sh && \
+    ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh && \
+    echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    /opt/conda/bin/conda update -n base -c defaults conda -y && \
+    /opt/conda/bin/conda create -y -n my python=3.12 && \
+    /opt/conda/bin/conda clean -afy
+
+ENV PATH=/opt/conda/envs/my/bin:$PATH
+ENV OPENCV_IO_ENABLE_OPENEXR=1
+ENV UV_NO_CACHE=1
+
+RUN conda init bash && \
+    echo "conda activate my" >> ~/.bashrc && \
+    conda activate my && \
+    pip install --no-cache-dir uv && \
+    uv pip install \
+      torch==2.6.0 torchvision==0.21.0 xformers==0.0.29.post3 \
+      --index-url https://download.pytorch.org/whl/cu124
+
+COPY requirements.txt /tmp/requirements.txt
+RUN conda activate my && \
+    uv pip install -r /tmp/requirements.txt \
+      numpy==1.26.4 opencv-contrib-python==4.11.0.86 && \
+    uv pip install \
+      onnxruntime-gpu onnx pycuda cuda-python h5py \
+      tensorrt-cu12==${TRT_VERSION} \
+      tensorrt-lean-cu12==${TRT_VERSION} \
+      tensorrt-dispatch-cu12==${TRT_VERSION} && \
+    conda install -y -c conda-forge libstdcxx-ng && \
+    conda clean -afy && \
+    { uv cache clean 2>/dev/null || true; } && \
+    rm -rf /root/.cache /tmp/*
+
+# This .deb registers a local repository; it does not install TensorRT itself.
+# Register its key, install the exact 10.11 runtime/tools, then remove the large
+# embedded repository so it is not retained in the final image layer.
+RUN cd / && \
+    wget --quiet https://developer.download.nvidia.com/compute/tensorrt/10.11.0/local_installers/nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9_1.0-1_amd64.deb && \
+    dpkg -i /nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9_1.0-1_amd64.deb && \
+    cp /var/nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9/*-keyring.gpg /usr/share/keyrings/ && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      libnvinfer10=${TRT_DEB_VERSION} \
+      libnvinfer-lean10=${TRT_DEB_VERSION} \
+      libnvinfer-plugin10=${TRT_DEB_VERSION} \
+      libnvinfer-vc-plugin10=${TRT_DEB_VERSION} \
+      libnvonnxparsers10=${TRT_DEB_VERSION} \
+      libnvinfer-dispatch10=${TRT_DEB_VERSION} \
+      libnvinfer-bin=${TRT_DEB_VERSION} && \
+    rm -f /nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9_1.0-1_amd64.deb && \
+    rm -rf /var/nv-tensorrt-local-repo-ubuntu2204-10.11.0-cuda-12.9 \
+      /var/lib/apt/lists/* /var/cache/apt/* /root/.cache /tmp/*
+
+# nvidia-modelopt[torch] is intentionally excluded: its current torch extra
+# resolves a new Torch/CUDA 13 stack and replaces the pinned cu124 environment.
+RUN conda activate my && \
+    uv pip check && \
+    python -c "import torch, torchvision, xformers, tensorrt as trt; print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'xformers', xformers.__version__, 'tensorrt', trt.__version__); assert torch.__version__ == '2.6.0+cu124'; assert torchvision.__version__ == '0.21.0+cu124'; assert xformers.__version__ == '0.0.29.post3'; assert trt.__version__ == '${TRT_VERSION}'" && \
+    test "$(dpkg-query -W -f='${Version}' libnvinfer-bin)" = "${TRT_DEB_VERSION}" && \
+    ln -sf /usr/src/tensorrt/bin/trtexec /usr/local/bin/trtexec && \
+    trtexec --help 2>&1 | grep -q 'TensorRT v101100'
+
+SHELL ["/bin/bash", "-c", "source ~/.bashrc && conda activate my"]

@@ -13,3 +13,5 @@ output/
 .claude/
 cpp/build/
 output_single_onnx_d405
+
+rosbag

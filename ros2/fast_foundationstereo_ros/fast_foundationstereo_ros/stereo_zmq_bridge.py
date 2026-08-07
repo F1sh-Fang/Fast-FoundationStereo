@@ -138,8 +138,10 @@ class StereoZmqBridge(Node):
         self._warned_missing_info = False
         self._calibration_logged = False
         self._warned_missing_color = False
+        self._warned_color_shape = False
+        self._camera_color_cache = OrderedDict()
         self._left_color_cache = OrderedDict()
-        self._color_cache_size = 8
+        self._color_cache_size = int(self._parameter("color_cache_size"))
         self._socket_lock = threading.Lock()
 
         sensor_qos = QoSProfile(
@@ -160,6 +162,15 @@ class StereoZmqBridge(Node):
             self._right_info_callback,
             sensor_qos,
         )
+        color_image_topic = str(self._parameter("color_image_topic"))
+        self.color_subscription = None
+        if color_image_topic:
+            self.color_subscription = self.create_subscription(
+                Image,
+                color_image_topic,
+                self._color_callback,
+                sensor_qos,
+            )
 
         left_sub = Subscriber(
             self, Image, self._parameter("left_image_topic"), qos_profile=sensor_qos
@@ -223,6 +234,9 @@ class StereoZmqBridge(Node):
             "right_image_topic": "/camera/camera/infra2/image_rect_raw",
             "left_camera_info_topic": "/camera/camera/infra1/camera_info",
             "right_camera_info_topic": "/camera/camera/infra2/camera_info",
+            "color_image_topic": "/camera/camera/color/image_raw",
+            "color_sync_slop": 0.05,
+            "color_cache_size": 16,
             "image_endpoint": "tcp://0.0.0.0:5560",
             "result_endpoint": "tcp://127.0.0.1:5561",
             "depth_topic": "/fast_foundationstereo/depth",
@@ -248,6 +262,63 @@ class StereoZmqBridge(Node):
 
     def _right_info_callback(self, message):
         self.right_info = message
+
+    @staticmethod
+    def _stamp_nanoseconds(message):
+        return (
+            int(message.header.stamp.sec) * 1_000_000_000
+            + int(message.header.stamp.nanosec)
+        )
+
+    def _color_callback(self, message):
+        try:
+            raw = self.cv_bridge.imgmsg_to_cv2(
+                message, desired_encoding="passthrough"
+            )
+            color = _to_rgb_uint8(raw, message.encoding)
+        except Exception as exc:  # cv_bridge exceptions vary by ROS distribution
+            self.get_logger().warning(f"Cannot decode color frame: {exc}")
+            return
+
+        stamp_ns = self._stamp_nanoseconds(message)
+        self._camera_color_cache[stamp_ns] = color
+        while len(self._camera_color_cache) > self._color_cache_size:
+            self._camera_color_cache.popitem(last=False)
+
+    def _matching_camera_color(self, message, output_shape):
+        if not self._camera_color_cache:
+            return None
+
+        stamp_ns = self._stamp_nanoseconds(message)
+        best_stamp = min(
+            self._camera_color_cache,
+            key=lambda cached_stamp: abs(cached_stamp - stamp_ns),
+        )
+        slop_ns = int(float(self._parameter("color_sync_slop")) * 1_000_000_000)
+        if abs(best_stamp - stamp_ns) > slop_ns:
+            stale_before = stamp_ns - slop_ns
+            while self._camera_color_cache:
+                oldest_stamp = next(iter(self._camera_color_cache))
+                if oldest_stamp >= stale_before:
+                    break
+                self._camera_color_cache.popitem(last=False)
+            return None
+
+        color = self._camera_color_cache[best_stamp]
+        if color.shape[:2] != output_shape:
+            if not self._warned_color_shape:
+                self.get_logger().warning(
+                    "Color/stereo resolution mismatch; resizing color image from "
+                    f"{color.shape[1]}x{color.shape[0]} to "
+                    f"{output_shape[1]}x{output_shape[0]} for PointCloud2"
+                )
+                self._warned_color_shape = True
+            color = cv2.resize(
+                color,
+                (output_shape[1], output_shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return np.ascontiguousarray(color)
 
     def _stereo_callback(self, left_message, right_message):
         if self.left_info is None or self.right_info is None:
@@ -304,7 +375,18 @@ class StereoZmqBridge(Node):
         sequence = self.sequence
         self.sequence += 1
         if self.publish_point_cloud:
-            self._left_color_cache[sequence] = left_color
+            point_cloud_color = self._matching_camera_color(
+                left_message, left.shape
+            )
+            if point_cloud_color is None:
+                point_cloud_color = left_color
+                if not self._warned_missing_color:
+                    self.get_logger().warning(
+                        "No synchronized D405 color frame available for PointCloud2; "
+                        "falling back to the left infrared image"
+                    )
+                    self._warned_missing_color = True
+            self._left_color_cache[sequence] = point_cloud_color
             while len(self._left_color_cache) > self._color_cache_size:
                 self._left_color_cache.popitem(last=False)
         try:

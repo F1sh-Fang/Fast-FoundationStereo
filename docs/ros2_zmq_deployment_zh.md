@@ -102,7 +102,7 @@ ros2 launch fast_foundationstereo_ros d405_ffs.launch.py publish_point_cloud:=tr
 
 点云的序列化和带宽开销较大，实时控制只使用深度图时建议保持关闭。
 
-开启点云后，消息包含标准 `x`、`y`、`z`、`rgb` 字段。颜色来自产生该深度结果的左侧 `infra1` 图像，并通过 sequence 做帧匹配；D405 的 `Y8/mono8` 双目图像会复制到 RGB 三个通道，因此 RViz 中显示为灰度颜色。如果没有匹配到缓存图像，点云仍会发布，但该帧颜色为黑色。
+开启点云后，消息包含标准 `x`、`y`、`z`、`rgb` 字段。桥接节点默认订阅 `/camera/camera/color/image_raw`，将时间戳最接近的 D405 彩色图与 FoundationStereo 深度匹配，并通过 sequence 缓存到对应的推理结果。若暂时没有匹配到彩色帧，则回退到左侧 `infra1` 灰度图，不会中断深度或点云发布。
 
 ## 4. 创建并复用持久化 `ffs` 容器
 
@@ -133,13 +133,38 @@ docker build --network host -t ffs -f docker/dockerfile .
 
 需要停止容器但保留全部环境时执行 `docker stop ffs`。只有手动执行 `docker rm ffs` 才会删除容器可写层。
 
+进入容器后，本文所有“容器内执行”命令都默认先完成以下初始化：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+source /opt/conda/etc/profile.d/conda.sh
+conda activate my
+```
+
+如果终端提示符已经带有 `(my)`，只需确认当前目录是
+`/workspace/Fast-FoundationStereo`，不必重复激活环境。
+
 ## 5. 启动容器内推理服务
 
 使用原生 PyTorch 权重启动（默认 4 次迭代以降低实时延迟）：
 
+在宿主机执行：
+
 ```bash
 cd /home/f1sh/DexHand/Fast-FoundationStereo
 ./docker/exec_zmq_server.sh \
+  --model_file weights/23-36-37/model_best_bp2_serialize.pth \
+  --valid_iters 4 \
+  --max_disp 192 \
+  --zmin 0.05 \
+  --zmax 2.0
+```
+
+已经进入 `ffs` 容器时，直接执行 Python 服务：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/zmq_stereo_server.py \
   --model_file weights/23-36-37/model_best_bp2_serialize.pth \
   --valid_iters 4 \
   --max_disp 192 \
@@ -157,8 +182,20 @@ FFS_PROJECT_IN_CONTAINER=/实际/容器内路径 ./docker/exec_zmq_server.sh
 
 若已经导出固定 640x480 的 TensorRT engine，可直接替换模型参数：
 
+在宿主机执行：
+
 ```bash
 ./docker/exec_zmq_server.sh \
+  --model_file /path/to/fast_foundationstereo.engine \
+  --config_file /path/to/fast_foundationstereo.yaml \
+  --zmax 2.0
+```
+
+已经进入 `ffs` 容器时执行：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/zmq_stereo_server.py \
   --model_file /path/to/fast_foundationstereo.engine \
   --config_file /path/to/fast_foundationstereo.yaml \
   --zmax 2.0
@@ -202,9 +239,25 @@ TensorRT 适合固定分辨率的实时推理。下面命令在持久化 `ffs` �
 
 #### 1. 导出 640×480 单模型 ONNX
 
+从宿主机执行：
+
 ```bash
 docker exec -w /workspace/Fast-FoundationStereo ffs \
   /opt/conda/envs/my/bin/python scripts/make_single_onnx.py \
+  --model_dir weights/23-36-37/model_best_bp2_serialize.pth \
+  --save_path output_single_onnx_d405 \
+  --onnx_name fast_foundationstereo_d405 \
+  --height 480 \
+  --width 640 \
+  --valid_iters 4 \
+  --max_disp 192
+```
+
+已经进入 `ffs` 容器时执行：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/make_single_onnx.py \
   --model_dir weights/23-36-37/model_best_bp2_serialize.pth \
   --save_path output_single_onnx_d405 \
   --onnx_name fast_foundationstereo_d405 \
@@ -218,25 +271,48 @@ docker exec -w /workspace/Fast-FoundationStereo ffs \
 
 #### 2. 转换 FP16 ONNX 并构建 TensorRT engine
 
-容器当前使用 TensorRT 11.2。这个版本的 `trtexec` 已移除旧版的
-`--fp16` 选项，并且采用强类型网络；因此要先把 FP32 ONNX 显式转换成
-FP16，再调用 `trtexec`（不要再添加 `--fp16`）。转换脚本还会为
-`GridSample`、`MatMul`、`ConvTranspose` 等 TensorRT 11 要求严格同类型的
-节点补齐 Cast。
+容器当前固定使用 TensorRT 10.11.0.33。下面仍先把 FP32 ONNX 显式转换成
+FP16，再调用 `trtexec` 构建 engine。转换脚本会为 `GridSample`、`MatMul`、
+`ConvTranspose` 等要求严格同类型的节点补齐 Cast。
+
+从宿主机执行转换：
 
 ```bash
 docker exec -w /workspace/Fast-FoundationStereo ffs \
   /opt/conda/envs/my/bin/python scripts/convert_onnx_fp16.py \
   --input output_single_onnx_d405/fast_foundationstereo_d405.onnx \
-  --output output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt11e.onnx \
+  --output output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
   --keep_io_types
 ```
 
+已经进入 `ffs` 容器时，直接执行 Python 转换脚本：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/convert_onnx_fp16.py \
+  --input output_single_onnx_d405/fast_foundationstereo_d405.onnx \
+  --output output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
+  --keep_io_types
+```
+
+从宿主机执行 engine 构建：
+
 ```bash
 docker exec -w /workspace/Fast-FoundationStereo ffs \
-  /usr/bin/trtexec \
-  --onnx=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt11e.onnx \
-  --saveEngine=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt11e.engine \
+  /usr/src/tensorrt/bin/trtexec \
+  --onnx=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
+  --saveEngine=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --memPoolSize=workspace:4096 \
+  --skipInference
+```
+
+已经进入 `ffs` 容器时执行：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
+  --saveEngine=output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
   --memPoolSize=workspace:4096 \
   --skipInference
 ```
@@ -245,10 +321,25 @@ engine 与构建它的 GPU、CUDA、TensorRT 版本相关；更换机器或镜�
 
 #### 3. 用 TensorRT engine 启动 ZMQ 服务
 
+从宿主机执行：
+
 ```bash
 cd /home/f1sh/DexHand/Fast-FoundationStereo
 ./docker/exec_zmq_server.sh \
-  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt11e.engine \
+  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --config_file output_single_onnx_d405/fast_foundationstereo_d405.yaml \
+  --zmin 0.05 \
+  --zmax 2.0 \
+  --warmup_width 640 \
+  --warmup_height 480
+```
+
+已经进入 `ffs` 容器时，直接运行 Python 服务：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/zmq_stereo_server.py \
+  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
   --config_file output_single_onnx_d405/fast_foundationstereo_d405.yaml \
   --zmin 0.05 \
   --zmax 2.0 \
@@ -262,7 +353,7 @@ TensorRT 后端的 `valid_iters` 和 `max_disp` 已经固化在 ONNX/engine 中�
 ros2 topic echo /fast_foundationstereo/inference_ms
 ```
 
-## 7. 验证 ROS2 输出
+## 6. 验证 ROS2 输出
 
 ```bash
 ros2 topic hz /fast_foundationstereo/depth
