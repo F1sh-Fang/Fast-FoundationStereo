@@ -305,7 +305,7 @@ def parse_args():
     )
     parser.add_argument(
         "--two_engine_dir",
-        default="",
+        default="output_two_engine_d405",
         help=(
             "Directory containing feature_runner.engine, post_runner.engine, "
             "and onnx.yaml; takes precedence over --model_file"
@@ -331,7 +331,10 @@ def parse_args():
         help="Keep pixels whose correspondence falls outside the right image",
     )
     parser.add_argument("--log_every", type=int, default=30)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.cuda_graph = bool(args.two_engine_dir)
+
+    return args
 
 
 def main():
