@@ -127,16 +127,11 @@ python scripts/make_single_onnx.py --model_dir weights/23-36-37/model_best_bp2_s
 | `--max_disp`      | Maximum disparity for volume encoding, 192 should be enough, unless you need to sense very near objects (e.g. <0.1m). Increasing it runs slower and uses more memory. |
 | `--onnx_name`     | Base name for the saved ONNX file (default: `fast_foundationstereo`)     |
 
-For TensorRT 11.x, convert the graph to FP16 first (TensorRT 11 uses strongly
-typed networks and removed the legacy `trtexec --fp16` switch):
+Build an FP16 TensorRT engine directly from the exported ONNX model:
 ```bash
-python scripts/convert_onnx_fp16.py \
-  --input output/fast_foundationstereo.onnx \
-  --output output/fast_foundationstereo_fp16.onnx \
-  --keep_io_types
-trtexec --onnx=output/fast_foundationstereo_fp16.onnx \
+trtexec --onnx=output/fast_foundationstereo.onnx \
   --saveEngine=output/fast_foundationstereo_fp16.engine \
-  --memPoolSize=workspace:4096 --skipInference
+  --fp16 --memPoolSize=workspace:4096 --skipInference
 ```
 
 To run inference with the single ONNX or TRT engine:
@@ -187,8 +182,8 @@ Refer to `scripts/make_onnx.py` for a comprehensive list of available flags.
 
 Then convert from ONNX to TRT:
 ```bash
-trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.engine --memPoolSize=workspace:4096
-trtexec --onnx=output/post_runner.onnx --saveEngine=output/post_runner.engine --memPoolSize=workspace:4096
+trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.engine --fp16 --memPoolSize=workspace:4096
+trtexec --onnx=output/post_runner.onnx --saveEngine=output/post_runner.engine --fp16 --memPoolSize=workspace:4096
 ```
 
 To use the two-stage TRT for inference:

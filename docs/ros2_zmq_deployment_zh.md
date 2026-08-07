@@ -269,39 +269,20 @@ python scripts/make_single_onnx.py \
 
 `height` 和 `width` 必须是 32 的倍数，并且建议与 `d405_stereo.launch.py` 的 640×480 输入保持一致。需要更近距离时，在这一步将 `--max_disp` 一起改成 256 或 384。
 
-#### 2. 转换 FP16 ONNX 并构建 TensorRT engine
+#### 2. 直接构建 FP16 TensorRT engine
 
-容器当前固定使用 TensorRT 10.11.0.33。下面仍先把 FP32 ONNX 显式转换成
-FP16，再调用 `trtexec` 构建 engine。转换脚本会为 `GridSample`、`MatMul`、
-`ConvTranspose` 等要求严格同类型的节点补齐 Cast。
+容器当前固定使用 TensorRT 10.11.0.33，可以直接通过官方
+`trtexec --fp16` 从导出的 FP32 ONNX 构建 FP16 engine，不需要额外转换
+ONNX 图。
 
-从宿主机执行转换：
-
-```bash
-docker exec -w /workspace/Fast-FoundationStereo ffs \
-  /opt/conda/envs/my/bin/python scripts/convert_onnx_fp16.py \
-  --input output_single_onnx_d405/fast_foundationstereo_d405.onnx \
-  --output output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
-  --keep_io_types
-```
-
-已经进入 `ffs` 容器时，直接执行 Python 转换脚本：
-
-```bash
-cd /workspace/Fast-FoundationStereo
-python scripts/convert_onnx_fp16.py \
-  --input output_single_onnx_d405/fast_foundationstereo_d405.onnx \
-  --output output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
-  --keep_io_types
-```
-
-从宿主机执行 engine 构建：
+从宿主机执行：
 
 ```bash
 docker exec -w /workspace/Fast-FoundationStereo ffs \
   /usr/src/tensorrt/bin/trtexec \
-  --onnx=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
-  --saveEngine=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --onnx=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405.onnx \
+  --saveEngine=/workspace/Fast-FoundationStereo/output_single_onnx_d405/fast_foundationstereo_d405_fp16.engine \
+  --fp16 \
   --memPoolSize=workspace:4096 \
   --skipInference
 ```
@@ -311,8 +292,9 @@ docker exec -w /workspace/Fast-FoundationStereo ffs \
 ```bash
 cd /workspace/Fast-FoundationStereo
 /usr/src/tensorrt/bin/trtexec \
-  --onnx=output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.onnx \
-  --saveEngine=output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --onnx=output_single_onnx_d405/fast_foundationstereo_d405.onnx \
+  --saveEngine=output_single_onnx_d405/fast_foundationstereo_d405_fp16.engine \
+  --fp16 \
   --memPoolSize=workspace:4096 \
   --skipInference
 ```
@@ -326,7 +308,7 @@ engine 与构建它的 GPU、CUDA、TensorRT 版本相关；更换机器或镜�
 ```bash
 cd /home/f1sh/DexHand/Fast-FoundationStereo
 ./docker/exec_zmq_server.sh \
-  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16.engine \
   --config_file output_single_onnx_d405/fast_foundationstereo_d405.yaml \
   --zmin 0.05 \
   --zmax 2.0 \
@@ -339,7 +321,7 @@ cd /home/f1sh/DexHand/Fast-FoundationStereo
 ```bash
 cd /workspace/Fast-FoundationStereo
 python scripts/zmq_stereo_server.py \
-  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16_trt10.engine \
+  --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16.engine \
   --config_file output_single_onnx_d405/fast_foundationstereo_d405.yaml \
   --zmin 0.05 \
   --zmax 2.0 \
