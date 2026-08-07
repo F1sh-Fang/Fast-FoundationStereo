@@ -16,12 +16,18 @@
 
 不要安装 `nvidia-modelopt[torch]`。它可能重新解析 Torch 依赖，并下载另一套 Torch/CUDA 运行库。
 
+先指定仓库的实际位置，目录名可以任意：
+
+```bash
+export FOUNDATIONSTEREO_ROOT=/absolute/path/to/Fast-FoundationStereo
+```
+
 ## 1. 在宿主机准备离线安装包
 
 进入工程：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 mkdir -p docker/packages
 ```
 
@@ -58,7 +64,7 @@ docker pull nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 确保没有同名旧容器，再从工程根目录创建 `ffs`：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 
 docker run --gpus all \
   --runtime nvidia \

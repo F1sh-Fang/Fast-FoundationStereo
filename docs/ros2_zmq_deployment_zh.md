@@ -23,12 +23,20 @@ fast_foundationstereo_ros (宿主机，ROS2)
 
 输出消息继承左红外图像的时间戳和 optical frame。深度仍处在左红外光学坐标系中，因此不需要发布新的 TF。
 
+下文使用 `SFP_PICK_WS` 表示 ROS2 工作区。路径和目录名可以任意，只需在当前
+终端设置一次实际位置：
+
+```bash
+export SFP_PICK_WS=/absolute/path/to/your/ros2_workspace
+export FOUNDATIONSTEREO_ROOT=/absolute/path/to/Fast-FoundationStereo
+```
+
 ## 1. 确认 D405 话题
 
 先在 ROS2 工作区启动新增的双目相机 launch：
 
 ```bash
-cd /home/f1sh/DexHand/sfp_pick_ws
+cd "$SFP_PICK_WS"
 source install/setup.bash
 ros2 launch camera d405_stereo.launch.py
 ```
@@ -65,10 +73,10 @@ baseline = abs(P_right[0,3] / P_right[0,0] - P_left[0,3] / P_left[0,0])
 ROS2 包保存在本工程的 `ros2/fast_foundationstereo_ros`。可以让现有工作区直接发现它，无需复制源码：
 
 ```bash
-cd /home/f1sh/DexHand/sfp_pick_ws
+cd "$SFP_PICK_WS"
 source /opt/ros/humble/setup.bash
 colcon build \
-  --base-paths src /home/f1sh/DexHand/Fast-FoundationStereo/ros2 \
+  --base-paths src "$FOUNDATIONSTEREO_ROOT/ros2" \
   --packages-select fast_foundationstereo_ros \
   --cmake-clean-cache
 source install/setup.bash
@@ -78,14 +86,14 @@ source install/setup.bash
 
 ```bash
 rosdep install --from-paths \
-  /home/f1sh/DexHand/Fast-FoundationStereo/ros2/fast_foundationstereo_ros \
+  "$FOUNDATIONSTEREO_ROOT/ros2/fast_foundationstereo_ros" \
   --ignore-src -r -y
 ```
 
 ## 3. 启动宿主机桥接节点
 
 ```bash
-source /home/f1sh/DexHand/sfp_pick_ws/install/setup.bash
+source "$SFP_PICK_WS/install/setup.bash"
 ros2 launch fast_foundationstereo_ros d405_ffs.launch.py
 ```
 
@@ -120,8 +128,7 @@ ros2 launch fast_foundationstereo_ros d405_ffs.launch.py \
 ```
 
 还可用 `point_cloud_max_rate:=15.0` 单独限制点云频率，不会降低深度图和推理
-频率。`0.0` 表示不限频。点云使用 sensor-data best-effort QoS；如果 RViz 没有
-显示，把 PointCloud2 Display 的 Reliability Policy 设置为 `Best Effort`。
+频率。`0.0` 表示不限频。点云发布使用 Reliable QoS，与 RViz 默认配置兼容。
 
 ## 4. 创建并复用持久化 `ffs` 容器
 
@@ -130,7 +137,7 @@ ros2 launch fast_foundationstereo_ros d405_ffs.launch.py \
 首次创建：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 bash docker/1_create_container.sh
 ```
 
@@ -170,7 +177,7 @@ conda activate my
 在宿主机执行：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 ./docker/exec_zmq_server.sh \
   --model_file weights/23-36-37/model_best_bp2_serialize.pth \
   --valid_iters 4 \
@@ -325,7 +332,7 @@ engine 与构建它的 GPU、CUDA、TensorRT 版本相关；更换机器或镜�
 从宿主机执行：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 ./docker/exec_zmq_server.sh \
   --model_file output_single_onnx_d405/fast_foundationstereo_d405_fp16.engine \
   --config_file output_single_onnx_d405/fast_foundationstereo_d405.yaml \
@@ -463,7 +470,7 @@ ROS2 或图像传输开销。第一轮 Triton autotune 可能较慢，应以 war
 从宿主机执行：
 
 ```bash
-cd /home/f1sh/DexHand/Fast-FoundationStereo
+cd "$FOUNDATIONSTEREO_ROOT"
 ./docker/exec_zmq_server.sh \
   --two_engine_dir output_two_engine_d405 \
   --cuda_graph \
