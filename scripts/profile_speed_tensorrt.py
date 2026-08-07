@@ -28,6 +28,7 @@ if __name__=="__main__":
   parser.add_argument('--total', type=int, default=30, help='total number of iterations')
   parser.add_argument('--build_volume_backend', default=None, choices=['pytorch1', 'triton'], help='backend for cost-volume build (default: from onnx.yaml)')
   parser.add_argument('--onnx_dir', default=f'{code_dir}/../output', type=str, help='directory containing TensorRT engines and onnx.yaml')
+  parser.add_argument('--cuda_graph', action='store_true', help='capture and replay the fixed-shape GPU pipeline')
   args = parser.parse_args()
 
   set_logging_format()
@@ -43,7 +44,9 @@ if __name__=="__main__":
       cfg[k] = args.__dict__[k]
   args = OmegaConf.create(cfg)
 
-  model = TrtRunner(args, args.onnx_dir+'/feature_runner.engine', args.onnx_dir+'/post_runner.engine')
+  model = TrtRunner(
+    args, args.onnx_dir+'/feature_runner.engine',
+    args.onnx_dir+'/post_runner.engine', use_cuda_graph=args.cuda_graph)
 
   H, W = int(args.image_size[0]), int(args.image_size[1])
   img0 = torch.randint(0, 256, (1, 3, H, W), dtype=torch.float32).cuda()

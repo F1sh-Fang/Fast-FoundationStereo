@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -30,6 +31,8 @@ def generate_launch_description():
         DeclareLaunchArgument("image_endpoint", default_value="tcp://0.0.0.0:5560"),
         DeclareLaunchArgument("result_endpoint", default_value="tcp://127.0.0.1:5561"),
         DeclareLaunchArgument("publish_point_cloud", default_value="false"),
+        DeclareLaunchArgument("point_cloud_stride", default_value="1"),
+        DeclareLaunchArgument("point_cloud_max_rate", default_value="0.0"),
         DeclareLaunchArgument("baseline_override", default_value="0.0"),
         DeclareLaunchArgument("approximate_sync", default_value="false"),
     ]
@@ -48,9 +51,26 @@ def generate_launch_description():
             "color_sync_slop": LaunchConfiguration("color_sync_slop"),
             "image_endpoint": LaunchConfiguration("image_endpoint"),
             "result_endpoint": LaunchConfiguration("result_endpoint"),
-            "publish_point_cloud": LaunchConfiguration("publish_point_cloud"),
+            # PointCloud2 runs in C++ so serialization cannot block this bridge.
+            "publish_point_cloud": False,
             "baseline_override": LaunchConfiguration("baseline_override"),
             "approximate_sync": LaunchConfiguration("approximate_sync"),
         }],
     )
-    return LaunchDescription(arguments + [bridge])
+    point_cloud = Node(
+        package="fast_foundationstereo_ros",
+        executable="point_cloud_node",
+        name="fast_foundationstereo_point_cloud",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("publish_point_cloud")),
+        parameters=[{
+            "depth_topic": "/fast_foundationstereo/depth",
+            "camera_info_topic": "/fast_foundationstereo/camera_info",
+            "color_image_topic": LaunchConfiguration("color_image_topic"),
+            "point_cloud_topic": "/fast_foundationstereo/points",
+            "color_sync_slop": LaunchConfiguration("color_sync_slop"),
+            "point_cloud_stride": LaunchConfiguration("point_cloud_stride"),
+            "point_cloud_max_rate": LaunchConfiguration("point_cloud_max_rate"),
+        }],
+    )
+    return LaunchDescription(arguments + [bridge, point_cloud])

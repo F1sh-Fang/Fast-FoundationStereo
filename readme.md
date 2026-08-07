@@ -186,6 +186,30 @@ trtexec --onnx=output/feature_runner.onnx --saveEngine=output/feature_runner.eng
 trtexec --onnx=output/post_runner.onnx --saveEngine=output/post_runner.engine --fp16 --memPoolSize=workspace:4096
 ```
 
+Benchmark the two-engine pipeline (the Triton GWC kernel runs between the two
+TensorRT engines):
+
+```bash
+python scripts/profile_speed_tensorrt.py --onnx_dir output --warmup 15 --total 45
+```
+
+For fixed input shapes, add `--cuda_graph` to capture the complete GPU pipeline
+(feature engine, Triton GWC, and post engine) after its first warmup:
+
+```bash
+python scripts/profile_speed_tensorrt.py --onnx_dir output --warmup 15 --total 45 --cuda_graph
+```
+
+Run the ROS/ZMQ inference server with the same two-engine pipeline:
+
+```bash
+python scripts/zmq_stereo_server.py --two_engine_dir output --cuda_graph
+```
+
+CUDA Graph is a runtime optimization and is not embedded in either `.engine`
+file. Its first call performs Triton/TensorRT warmup and graph capture, so only
+steady-state calls should be used for performance measurements.
+
 To use the two-stage TRT for inference:
 ```bash
 python scripts/run_demo_tensorrt.py --onnx_dir output/ --left_file demo_data/left.png --right_file demo_data/right.png --intrinsic_file demo_data/K.txt --out_dir output/ --remove_invisible 0 --denoise_cloud 1  --get_pc 1 --zfar 100

@@ -373,7 +373,8 @@ class TrtPostRunner(nn.Module):
 
 
 class TrtRunner(nn.Module):
-  def __init__(self, args, feature_runner_engine_path, post_runner_engine_path):
+  def __init__(self, args, feature_runner_engine_path, post_runner_engine_path,
+               use_cuda_graph=False):
     super().__init__()
     import tensorrt as trt
     self.args = args
@@ -387,8 +388,17 @@ class TrtRunner(nn.Module):
       engine_data = file.read()
     self.post_engine = trt.Runtime(self.trt_logger).deserialize_cuda_engine(engine_data)
     self.post_context = self.post_engine.create_execution_context()
+    self.stream = torch.cuda.Stream()
     self.max_disp = args.max_disp
     self.cv_group = args.get('cv_group', 8)
+    self.use_cuda_graph = use_cuda_graph
+    self.cuda_graph = None
+    self.static_image1 = None
+    self.static_image2 = None
+    self.static_disp = None
+    self.feature_outputs = None
+    self.post_outputs = None
+    self.graph_refs = None
 
   def trt_dtype_to_torch(self, dt):
     import tensorrt as trt
@@ -409,19 +419,21 @@ class TrtRunner(nn.Module):
         names.append(name)
     return names
 
-  def run_trt(self, engine, context, inputs_by_name:dict):
+  def run_trt(self, engine, context, inputs_by_name:dict, outputs_by_name=None):
     import tensorrt as trt
     for name, tensor in list(inputs_by_name.items()):
       expected_dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
       if tensor.dtype != expected_dtype: inputs_by_name[name] = tensor.to(expected_dtype)
       if not inputs_by_name[name].is_contiguous(): inputs_by_name[name] = inputs_by_name[name].contiguous()
       context.set_input_shape(name, tuple(inputs_by_name[name].shape))
-    outputs = {}
-    out_names = [n for n in self.get_io_tensor_names(engine, trt.TensorIOMode.OUTPUT)]
-    for name in out_names:
-      shp = tuple(context.get_tensor_shape(name))
-      dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
-      outputs[name] = torch.empty(shp, device='cuda', dtype=dtype)
+    outputs = outputs_by_name
+    if outputs is None:
+      outputs = {}
+      out_names = self.get_io_tensor_names(engine, trt.TensorIOMode.OUTPUT)
+      for name in out_names:
+        shp = tuple(context.get_tensor_shape(name))
+        dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
+        outputs[name] = torch.empty(shp, device='cuda', dtype=dtype)
     for name, tensor in inputs_by_name.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
     for name, tensor in outputs.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
     stream = torch.cuda.current_stream().cuda_stream
@@ -429,17 +441,73 @@ class TrtRunner(nn.Module):
     assert ok
     return outputs
 
-  def forward(self, image1, image2):
+  def _forward_impl(self, image1, image2, keep_graph_refs=False):
     import tensorrt as trt
-    feat_out = self.run_trt(self.feature_engine, self.feature_context, {'left': image1, 'right': image2})
-    gwc_volume = build_gwc_volume_triton(feat_out['features_left_04'].half(), feat_out['features_right_04'].half(), self.args.max_disp//4, self.cv_group, normalize=self.args.normalize)
-    post_inputs = feat_out
-    post_inputs['gwc_volume'] = gwc_volume
+    feat_out = self.run_trt(
+      self.feature_engine, self.feature_context,
+      {'left': image1, 'right': image2}, self.feature_outputs)
+    if self.feature_outputs is None:
+      self.feature_outputs = feat_out
+
+    features_left_04 = feat_out['features_left_04'].half()
+    features_right_04 = feat_out['features_right_04'].half()
+    gwc_volume = build_gwc_volume_triton(
+      features_left_04, features_right_04, self.args.max_disp//4,
+      self.cv_group, normalize=self.args.normalize)
     in_names = self.get_io_tensor_names(self.post_engine, trt.TensorIOMode.INPUT)
-    tmp_keys = list(post_inputs.keys())
-    for k in tmp_keys:
-      if k not in in_names:
-        del post_inputs[k]
-    out = self.run_trt(self.post_engine, self.post_context, post_inputs)
-    disp = out['disp']
+    post_inputs = {name: feat_out[name] for name in in_names if name != 'gwc_volume'}
+    post_inputs['gwc_volume'] = gwc_volume
+    out = self.run_trt(
+      self.post_engine, self.post_context, post_inputs, self.post_outputs)
+    if self.post_outputs is None:
+      self.post_outputs = out
+    if keep_graph_refs:
+      self.graph_refs = (
+        feat_out, features_left_04, features_right_04, gwc_volume,
+        post_inputs, out)
+    return out['disp']
+
+  def _capture_cuda_graph(self, image1, image2):
+    self.static_image1 = torch.empty_like(image1)
+    self.static_image2 = torch.empty_like(image2)
+    self.static_image1.copy_(image1)
+    self.static_image2.copy_(image2)
+
+    # TensorRT initializes its contexts and Triton compiles/autotunes before capture.
+    for _ in range(3):
+      self._forward_impl(self.static_image1, self.static_image2)
+    self.stream.synchronize()
+
+    self.cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(self.cuda_graph, stream=self.stream):
+      self.static_disp = self._forward_impl(
+        self.static_image1, self.static_image2, keep_graph_refs=True)
+
+  def _validate_graph_input(self, tensor, static_tensor, name):
+    if tensor.shape != static_tensor.shape or tensor.dtype != static_tensor.dtype:
+      raise ValueError(
+        f"CUDA Graph {name} changed from "
+        f"{tuple(static_tensor.shape)}/{static_tensor.dtype} to "
+        f"{tuple(tensor.shape)}/{tensor.dtype}")
+
+  def forward(self, image1, image2):
+    caller_stream = torch.cuda.current_stream()
+    self.stream.wait_stream(caller_stream)
+    with torch.cuda.stream(self.stream):
+      image1.record_stream(self.stream)
+      image2.record_stream(self.stream)
+      if self.use_cuda_graph:
+        if self.cuda_graph is None:
+          self._capture_cuda_graph(image1, image2)
+        else:
+          self._validate_graph_input(image1, self.static_image1, 'image1')
+          self._validate_graph_input(image2, self.static_image2, 'image2')
+          self.static_image1.copy_(image1)
+          self.static_image2.copy_(image2)
+        self.cuda_graph.replay()
+        disp = self.static_disp
+      else:
+        disp = self._forward_impl(image1, image2)
+    caller_stream.wait_stream(self.stream)
+    disp.record_stream(caller_stream)
     return disp

@@ -131,6 +131,7 @@ class StereoZmqBridge(Node):
     def __init__(self):
         super().__init__("fast_foundationstereo_zmq_bridge")
         self._declare_parameters()
+        self.publish_point_cloud = bool(self._parameter("publish_point_cloud"))
         self.cv_bridge = CvBridge()
         self.sequence = 0
         self.left_info = None
@@ -164,7 +165,7 @@ class StereoZmqBridge(Node):
         )
         color_image_topic = str(self._parameter("color_image_topic"))
         self.color_subscription = None
-        if color_image_topic:
+        if self.publish_point_cloud and color_image_topic:
             self.color_subscription = self.create_subscription(
                 Image,
                 color_image_topic,
@@ -214,7 +215,6 @@ class StereoZmqBridge(Node):
         self.latency_publisher = self.create_publisher(
             Float32, self._parameter("inference_time_topic"), 10
         )
-        self.publish_point_cloud = bool(self._parameter("publish_point_cloud"))
         self.point_cloud_publisher = None
         if self.publish_point_cloud:
             self.point_cloud_publisher = self.create_publisher(

@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import yaml
 import zmq
+from omegaconf import OmegaConf
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,13 +180,82 @@ class ExportedModelRunner:
         )
 
 
+class TwoEngineTrtRunner:
+    """Run feature/post TensorRT engines with the Triton GWC kernel between."""
+
+    def __init__(self, args):
+        from core.foundation_stereo import TrtRunner
+
+        engine_dir = Path(args.two_engine_dir).resolve()
+        feature_engine = engine_dir / "feature_runner.engine"
+        post_engine = engine_dir / "post_runner.engine"
+        cfg_path = (
+            Path(args.config_file).resolve()
+            if args.config_file
+            else engine_dir / "onnx.yaml"
+        )
+        for path in (feature_engine, post_engine, cfg_path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+
+        with cfg_path.open("r", encoding="utf-8") as stream:
+            cfg = OmegaConf.create(yaml.safe_load(stream) or {})
+        self.target_height, self.target_width = map(int, cfg.image_size)
+        self.max_disp = int(cfg.max_disp)
+        self.runner = TrtRunner(
+            cfg, str(feature_engine), str(post_engine),
+            use_cuda_graph=args.cuda_graph,
+        )
+        logging.info(
+            "Loaded two-engine TensorRT model at fixed resolution %dx%d%s",
+            self.target_width,
+            self.target_height,
+            " with CUDA Graph" if args.cuda_graph else "",
+        )
+
+    @torch.inference_mode()
+    def __call__(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        if left.shape[:2] != (self.target_height, self.target_width):
+            left = cv2.resize(
+                left, (self.target_width, self.target_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            right = cv2.resize(
+                right, (self.target_width, self.target_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        left_tensor = (
+            torch.as_tensor(left, device="cuda", dtype=torch.float32)
+            .unsqueeze(0)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        right_tensor = (
+            torch.as_tensor(right, device="cuda", dtype=torch.float32)
+            .unsqueeze(0)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        disparity = self.runner(left_tensor, right_tensor)
+        return (
+            disparity.float().detach().cpu().numpy()
+            .reshape(self.target_height, self.target_width)
+            .clip(0, None)
+        )
+
+
 def make_runner(args):
+    if args.two_engine_dir:
+        return TwoEngineTrtRunner(args)
     suffix = Path(args.model_file).suffix.lower()
     if suffix == ".pth":
         return NativeTorchRunner(args)
     if suffix in (".onnx", ".engine"):
         return ExportedModelRunner(args)
-    raise ValueError("--model_file must end in .pth, .onnx, or .engine")
+    raise ValueError(
+        "use --two_engine_dir, or provide a --model_file ending in "
+        ".pth, .onnx, or .engine"
+    )
 
 
 def recv_latest(socket):
@@ -232,6 +302,18 @@ def parse_args():
     )
     parser.add_argument(
         "--config_file", default="", help="Config YAML for ONNX/TensorRT"
+    )
+    parser.add_argument(
+        "--two_engine_dir",
+        default="",
+        help=(
+            "Directory containing feature_runner.engine, post_runner.engine, "
+            "and onnx.yaml; takes precedence over --model_file"
+        ),
+    )
+    parser.add_argument(
+        "--cuda_graph", action="store_true",
+        help="Capture and replay the fixed-shape two-engine GPU pipeline",
     )
     parser.add_argument("--host_ip", default="127.0.0.1")
     parser.add_argument("--image_port", type=int, default=5560)

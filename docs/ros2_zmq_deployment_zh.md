@@ -69,7 +69,8 @@ cd /home/f1sh/DexHand/sfp_pick_ws
 source /opt/ros/humble/setup.bash
 colcon build \
   --base-paths src /home/f1sh/DexHand/Fast-FoundationStereo/ros2 \
-  --packages-select fast_foundationstereo_ros
+  --packages-select fast_foundationstereo_ros \
+  --cmake-clean-cache
 source install/setup.bash
 ```
 
@@ -102,7 +103,25 @@ ros2 launch fast_foundationstereo_ros d405_ffs.launch.py publish_point_cloud:=tr
 
 点云的序列化和带宽开销较大，实时控制只使用深度图时建议保持关闭。
 
-开启点云后，消息包含标准 `x`、`y`、`z`、`rgb` 字段。桥接节点默认订阅 `/camera/camera/color/image_raw`，将时间戳最接近的 D405 彩色图与 FoundationStereo 深度匹配，并通过 sequence 缓存到对应的推理结果。若暂时没有匹配到彩色帧，则回退到左侧 `infra1` 灰度图，不会中断深度或点云发布。
+开启点云后，launch 会启动独立的 C++ 点云节点，Python ZMQ 桥不再生成和
+序列化点云，因此点云负载不会阻塞图像发送和推理结果轮询。消息包含标准
+`x`、`y`、`z`、`rgb` 字段。C++ 节点默认订阅
+`/camera/camera/color/image_raw`，将时间戳最接近的 D405 彩色图与
+FoundationStereo 深度匹配。没有匹配彩色帧时发布黑色 RGB，XYZ 深度不受影响。
+
+完整 `640x480` 点云每帧约 4.9 MB。默认 `point_cloud_stride:=1` 保留全部
+307200 个点；只用于 RViz 或抓取可视化时，建议按 2 倍步长采样，点数和 DDS
+带宽都会降为四分之一：
+
+```bash
+ros2 launch fast_foundationstereo_ros d405_ffs.launch.py \
+  publish_point_cloud:=true \
+  point_cloud_stride:=2
+```
+
+还可用 `point_cloud_max_rate:=15.0` 单独限制点云频率，不会降低深度图和推理
+频率。`0.0` 表示不限频。点云使用 sensor-data best-effort QoS；如果 RViz 没有
+显示，把 PointCloud2 Display 的 Reliability Policy 设置为 `Best Effort`。
 
 ## 4. 创建并复用持久化 `ffs` 容器
 
@@ -335,6 +354,147 @@ TensorRT 后端的 `valid_iters` 和 `max_disp` 已经固化在 ONNX/engine 中�
 ros2 topic echo /fast_foundationstereo/inference_ms
 ```
 
+### 官方双 engine + Triton GWC 部署（推荐高性能）
+
+单 engine ONNX 为了兼容标准 ONNX，会把 GWC cost volume 展开成大量
+`Pad`、`Slice` 和 `Stack` 节点，640×480 下性能提升有限。官方双 engine
+路径把网络拆为：
+
+```text
+feature_runner.engine
+        |
+        v
+Triton GWC cost-volume kernel
+        |
+        v
+post_runner.engine
+```
+
+中间 cost volume 继续使用项目自带的 Triton CUDA kernel，通常比单 engine
+路径更适合追求低延迟。
+
+#### 1. 导出双 ONNX
+
+从宿主机执行：
+
+```bash
+docker exec -w /workspace/Fast-FoundationStereo ffs \
+  /opt/conda/envs/my/bin/python scripts/make_onnx.py \
+  --model_dir weights/23-36-37/model_best_bp2_serialize.pth \
+  --save_path output_two_engine_d405 \
+  --height 480 \
+  --width 640 \
+  --valid_iters 4 \
+  --max_disp 192
+```
+
+已经进入 `ffs` 容器时执行：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/make_onnx.py \
+  --model_dir weights/23-36-37/model_best_bp2_serialize.pth \
+  --save_path output_two_engine_d405 \
+  --height 480 \
+  --width 640 \
+  --valid_iters 4 \
+  --max_disp 192
+```
+
+导出后目录应包含：
+
+```text
+output_two_engine_d405/
+├── feature_runner.onnx
+├── post_runner.onnx
+└── onnx.yaml
+```
+
+#### 2. 构建两个 FP16 engine
+
+从宿主机执行：
+
+```bash
+docker exec -w /workspace/Fast-FoundationStereo ffs \
+  /usr/src/tensorrt/bin/trtexec \
+  --onnx=output_two_engine_d405/feature_runner.onnx \
+  --saveEngine=output_two_engine_d405/feature_runner.engine \
+  --fp16
+
+docker exec -w /workspace/Fast-FoundationStereo ffs \
+  /usr/src/tensorrt/bin/trtexec \
+  --onnx=output_two_engine_d405/post_runner.onnx \
+  --saveEngine=output_two_engine_d405/post_runner.engine \
+  --fp16
+```
+
+已经进入 `ffs` 容器时执行：
+
+```bash
+trtexec \
+  --onnx=output_two_engine_d405/feature_runner.onnx \
+  --saveEngine=output_two_engine_d405/feature_runner.engine \
+  --fp16
+
+trtexec \
+  --onnx=output_two_engine_d405/post_runner.onnx \
+  --saveEngine=output_two_engine_d405/post_runner.engine \
+  --fp16
+```
+
+最终目录应同时包含两个 `.onnx`、两个 `.engine` 和 `onnx.yaml`。
+
+#### 3. 先做纯推理测速
+
+```bash
+python scripts/profile_speed_tensorrt.py \
+  --onnx_dir output_two_engine_d405 \
+  --warmup 15 \
+  --total 45 \
+  --cuda_graph
+```
+
+该测速包含 feature engine、Triton GWC kernel 和 post engine，但不包含 ZMQ、
+ROS2 或图像传输开销。第一轮 Triton autotune 可能较慢，应以 warmup 之后的
+平均值为准。要做 A/B 对比，去掉 `--cuda_graph` 再运行同一条命令。
+
+#### 4. 启动双 engine ZMQ 服务
+
+从宿主机执行：
+
+```bash
+cd /home/f1sh/DexHand/Fast-FoundationStereo
+./docker/exec_zmq_server.sh \
+  --two_engine_dir output_two_engine_d405 \
+  --cuda_graph \
+  --zmin 0.05 \
+  --zmax 2.0 \
+  --warmup_width 640 \
+  --warmup_height 480
+```
+
+已经进入 `ffs` 容器时直接执行：
+
+```bash
+cd /workspace/Fast-FoundationStereo
+python scripts/zmq_stereo_server.py \
+  --two_engine_dir output_two_engine_d405 \
+  --cuda_graph \
+  --zmin 0.05 \
+  --zmax 2.0 \
+  --warmup_width 640 \
+  --warmup_height 480
+```
+
+`--two_engine_dir` 会自动读取目录中的 `feature_runner.engine`、
+`post_runner.engine` 和 `onnx.yaml`，并优先于 `--model_file`。
+
+`--cuda_graph` 只在运行时捕获 feature engine、Triton GWC 和 post engine，
+不需要重新生成 `.engine`。首次 warmup 会完成 Triton 编译、TensorRT 初始化和
+Graph 捕获，因此明显比后续帧慢。CUDA Graph 要求输入 shape 和 dtype 固定；
+这里由双 engine 导出的固定 `640x480` 尺寸保证这一点。ZMQ 收发、OpenCV
+预处理和结果回传 CPU 不在 Graph 内。
+
 ## 6. 验证 ROS2 输出
 
 ```bash
@@ -394,7 +554,7 @@ ss -ltnp | grep -E ':5560|:5561'
 1. 使用 `--valid_iters 2` 或 `4`。
 2. 原生 PyTorch 后端使用 `--scale 0.5`。
 3. 导出 640x480 ONNX 并构建 FP16 TensorRT engine。
-4. 固定输入尺寸并启用 `--useCudaGraph`。
-5. 保持 `publish_point_cloud:=false`，只发布深度与视差；带颜色的点云会增加 CPU 序列化和 DDS 带宽开销。
+4. 固定输入尺寸并启用 `--cuda_graph`。
+5. 点云只用于显示时使用 `publish_point_cloud:=true point_cloud_stride:=2`；实时控制只需深度时保持关闭。
 
 缩放不会改变最终深度图尺寸；服务端会把视差转换回原始图像的像素单位后再计算深度。
