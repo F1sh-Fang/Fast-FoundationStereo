@@ -6,6 +6,8 @@ find_package(ament_cmake_python REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 ament_python_install_package(${PROJECT_NAME})
 
@@ -16,7 +18,14 @@ target_compile_options(point_cloud_node PRIVATE
 )
 ament_target_dependencies(point_cloud_node cv_bridge rclcpp sensor_msgs)
 
-install(TARGETS point_cloud_node DESTINATION lib/${PROJECT_NAME})
+add_executable(depth_align_node src/depth_align_node.cpp)
+target_compile_features(depth_align_node PUBLIC cxx_std_17)
+target_compile_options(depth_align_node PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang>:-O3;-march=native;-mtune=native>
+)
+ament_target_dependencies(depth_align_node rclcpp sensor_msgs tf2 tf2_ros)
+
+install(TARGETS point_cloud_node depth_align_node DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS
   fast_foundationstereo_ros/stereo_zmq_bridge.py
   DESTINATION lib/${PROJECT_NAME}
