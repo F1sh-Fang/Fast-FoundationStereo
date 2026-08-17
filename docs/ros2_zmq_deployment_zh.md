@@ -1,6 +1,6 @@
 # Fast FoundationStereo：D405 + ROS2 + Docker/ZMQ 实时部署
 
-该部署把 ROS2 和 GPU 推理解耦：宿主机订阅 RealSense D405 的左右校正红外图像，使用 ZMQ 把最新一帧发到无 ROS 环境的 `ffs` 容器；容器完成 Fast FoundationStereo 推理后，将视差和米制深度发回宿主机并发布为标准 ROS2 消息。
+该部署把 ROS2 和 GPU 推理解耦：宿主机订阅 RealSense D405 的左右校正红外图像，使用 ZMQ 把最新一帧发到无 ROS 环境的 `ffs` 容器；容器完成 Fast FoundationStereo 推理后，只将米制深度发回宿主机并发布为标准 ROS2 消息。
 
 ## 架构与接口
 
@@ -10,16 +10,15 @@ D405 /infra1 + /infra2 + CameraInfo
              v
 fast_foundationstereo_ros (宿主机，ROS2)
   PUB tcp://0.0.0.0:5560  -- 左右 mono8 + 标定 -->  ffs 容器
-  SUB tcp://127.0.0.1:5561 <-- disparity + depth -- GPU 推理服务
+  SUB tcp://127.0.0.1:5561 <-- depth only -------- GPU 推理服务
              |
              +-- /fast_foundationstereo/depth        sensor_msgs/Image, 32FC1, m
-             +-- /fast_foundationstereo/disparity    stereo_msgs/DisparityImage, px
              +-- /fast_foundationstereo/camera_info  sensor_msgs/CameraInfo
              +-- /fast_foundationstereo/inference_ms std_msgs/Float32
              +-- /fast_foundationstereo/points       sensor_msgs/PointCloud2（可选）
 ```
 
-5560/5561 特意避开了 FoundationPose 默认使用的 5555/5556 端口。两侧都采用较小的 ZMQ 队列并主动丢弃旧帧，GPU 来不及处理时不会不断累积延迟。
+5560/5561 特意避开了 FoundationPose 默认使用的 5555/5556 端口。两侧都采用较小的 ZMQ 队列并主动丢弃旧帧，GPU 来不及处理时不会不断累积延迟。大数组使用 PyZMQ `memoryview` 和 `copy=False`；宿主机通过阻塞 ZMQ 线程收到 depth 后立即发布，不使用 ROS timer 轮询。
 
 输出消息继承左红外图像的时间戳和 optical frame。深度仍处在左红外光学坐标系中，因此不需要发布新的 TF。
 
@@ -82,7 +81,7 @@ colcon build \
 source install/setup.bash
 ```
 
-宿主机需要 `cv_bridge`、`message_filters`、`stereo_msgs`、NumPy 和 pyzmq。若 rosdep 尚未安装它们：
+宿主机需要 `cv_bridge`、`message_filters`、NumPy 和 pyzmq。若 rosdep 尚未安装它们：
 
 ```bash
 rosdep install --from-paths \
@@ -112,7 +111,7 @@ ros2 launch fast_foundationstereo_ros d405_ffs.launch.py publish_point_cloud:=tr
 点云的序列化和带宽开销较大，实时控制只使用深度图时建议保持关闭。
 
 开启点云后，launch 会启动独立的 C++ 点云节点，Python ZMQ 桥不再生成和
-序列化点云，因此点云负载不会阻塞图像发送和推理结果轮询。消息包含标准
+序列化点云，因此点云负载不会阻塞图像发送和推理结果接收。消息包含标准
 `x`、`y`、`z`、`rgb` 字段。C++ 节点默认订阅
 `/camera/camera/color/image_raw`，将时间戳最接近的 D405 彩色图与
 FoundationStereo 深度匹配。没有匹配彩色帧时发布黑色 RGB，XYZ 深度不受影响。
@@ -227,7 +226,7 @@ python scripts/zmq_stereo_server.py \
   --zmax 2.0
 ```
 
-`.pth`、`.onnx` 和 `.engine` 三种后端使用同一套 ZMQ/ROS2 接口。固定尺寸的 ONNX/TensorRT 输入会在容器内缩放，返回前再恢复到 D405 原始分辨率，并同步恢复视差的像素尺度。
+`.pth`、`.onnx` 和 `.engine` 三种后端使用同一套 ZMQ/ROS2 接口。固定尺寸的 ONNX/TensorRT 输入会在容器内缩放，计算深度前再恢复到 D405 原始分辨率，并同步恢复视差的像素尺度。视差只作为容器内计算深度的中间量，不通过 ZMQ 回传。
 
 ### `max_disp` 如何选择
 
@@ -507,7 +506,6 @@ Graph 捕获，因此明显比后续帧慢。CUDA Graph 要求输入 shape 和 d
 ```bash
 ros2 topic hz /fast_foundationstereo/depth
 ros2 topic echo /fast_foundationstereo/inference_ms
-ros2 topic info /fast_foundationstereo/disparity
 ```
 
 RViz2 中可添加：

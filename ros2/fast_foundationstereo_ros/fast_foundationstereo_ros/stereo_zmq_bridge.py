@@ -17,7 +17,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Float32
-from stereo_msgs.msg import DisparityImage
 
 
 def calibration_from_camera_info(left_info, right_info, baseline_override=0.0):
@@ -144,6 +143,8 @@ class StereoZmqBridge(Node):
         self._left_color_cache = OrderedDict()
         self._color_cache_size = int(self._parameter("color_cache_size"))
         self._socket_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._stop_event = threading.Event()
 
         sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -197,17 +198,10 @@ class StereoZmqBridge(Node):
         self.image_socket.setsockopt(zmq.SNDHWM, 2)
         self.image_socket.setsockopt(zmq.LINGER, 0)
         self.image_socket.bind(self._parameter("image_endpoint"))
-        self.result_socket = context.socket(zmq.SUB)
-        self.result_socket.setsockopt(zmq.RCVHWM, 2)
-        self.result_socket.setsockopt(zmq.LINGER, 0)
-        self.result_socket.connect(self._parameter("result_endpoint"))
-        self.result_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._result_endpoint = self._parameter("result_endpoint")
 
         self.depth_publisher = self.create_publisher(
             Image, self._parameter("depth_topic"), 10
-        )
-        self.disparity_publisher = self.create_publisher(
-            DisparityImage, self._parameter("disparity_topic"), 10
         )
         self.camera_info_publisher = self.create_publisher(
             CameraInfo, self._parameter("output_camera_info_topic"), 10
@@ -221,11 +215,15 @@ class StereoZmqBridge(Node):
                 PointCloud2, self._parameter("point_cloud_topic"), 2
             )
 
-        poll_period = float(self._parameter("result_poll_period"))
-        self.create_timer(poll_period, self._poll_results)
+        self._result_thread = threading.Thread(
+            target=self._receive_results,
+            name="foundationstereo_result_receiver",
+            daemon=True,
+        )
+        self._result_thread.start()
         self.get_logger().info(
             f"ZMQ bridge ready: {self._parameter('image_endpoint')} -> Docker, "
-            f"Docker -> {self._parameter('result_endpoint')}"
+            f"Docker -> {self._result_endpoint} (event-driven, depth-only)"
         )
 
     def _declare_parameters(self):
@@ -240,7 +238,6 @@ class StereoZmqBridge(Node):
             "image_endpoint": "tcp://0.0.0.0:5560",
             "result_endpoint": "tcp://127.0.0.1:5561",
             "depth_topic": "/fast_foundationstereo/depth",
-            "disparity_topic": "/fast_foundationstereo/disparity",
             "output_camera_info_topic": "/fast_foundationstereo/camera_info",
             "point_cloud_topic": "/fast_foundationstereo/points",
             "inference_time_topic": "/fast_foundationstereo/inference_ms",
@@ -249,7 +246,6 @@ class StereoZmqBridge(Node):
             "approximate_sync": False,
             "sync_queue_size": 5,
             "sync_slop": 0.01,
-            "result_poll_period": 0.002,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -386,47 +382,76 @@ class StereoZmqBridge(Node):
                         "falling back to the left infrared image"
                     )
                     self._warned_missing_color = True
-            self._left_color_cache[sequence] = point_cloud_color
-            while len(self._left_color_cache) > self._color_cache_size:
-                self._left_color_cache.popitem(last=False)
+            with self._cache_lock:
+                self._left_color_cache[sequence] = point_cloud_color
+                while len(self._left_color_cache) > self._color_cache_size:
+                    self._left_color_cache.popitem(last=False)
+        left = np.ascontiguousarray(left)
+        right = np.ascontiguousarray(right)
         try:
             with self._socket_lock:
                 self.image_socket.send_multipart(
                     [
                         json.dumps(metadata).encode("utf-8"),
-                        np.ascontiguousarray(left).tobytes(),
-                        np.ascontiguousarray(right).tobytes(),
+                        memoryview(left),
+                        memoryview(right),
                     ],
                     flags=zmq.NOBLOCK,
+                    copy=False,
                 )
         except zmq.Again:
             pass
 
-    def _poll_results(self):
-        latest = None
-        while True:
-            try:
-                latest = self.result_socket.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-        if latest is None:
-            return
+    def _receive_results(self):
+        context = zmq.Context.instance()
+        socket = context.socket(zmq.SUB)
+        socket.setsockopt(zmq.RCVHWM, 2)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        socket.connect(self._result_endpoint)
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
         try:
-            if len(latest) != 3:
-                raise ValueError(f"Expected 3 result parts, received {len(latest)}")
-            metadata = json.loads(latest[0].decode("utf-8"))
+            while not self._stop_event.is_set():
+                events = dict(poller.poll(timeout=100))
+                if socket not in events:
+                    continue
+                latest = socket.recv_multipart(copy=False)
+                while True:
+                    try:
+                        latest = socket.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False)
+                    except zmq.Again:
+                        break
+                self._handle_result(latest)
+        except zmq.ZMQError as exc:
+            if not self._stop_event.is_set():
+                self.get_logger().error(f"ZMQ result receiver stopped: {exc}")
+        finally:
+            poller.unregister(socket)
+            socket.close(linger=0)
+
+    def _handle_result(self, latest):
+        try:
+            if len(latest) != 2:
+                raise ValueError(
+                    f"Expected 2 result parts, received {len(latest)}")
+            metadata = json.loads(bytes(latest[0]))
             shape = tuple(metadata["shape"])
             dtype = np.dtype(metadata["dtype"])
-            disparity = np.frombuffer(latest[1], dtype=dtype).reshape(shape).copy()
-            depth = np.frombuffer(latest[2], dtype=dtype).reshape(shape).copy()
-            color = self._left_color_cache.pop(
-                int(metadata.get("sequence", -1)), None
-            )
-            self._publish_result(metadata, disparity, depth, color)
+            depth = np.frombuffer(
+                latest[1].buffer, dtype=dtype).reshape(shape)
+            with self._cache_lock:
+                color = self._left_color_cache.pop(
+                    int(metadata.get("sequence", -1)), None
+                )
+            self._publish_result(metadata, depth, color)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"Dropped malformed inference result: {exc}")
+        except Exception as exc:
+            self.get_logger().error(f"Cannot publish inference result: {exc}")
 
-    def _publish_result(self, metadata, disparity, depth, color=None):
+    def _publish_result(self, metadata, depth, color=None):
         stamp = rclpy.time.Time(
             seconds=int(metadata.get("stamp_sec", 0)),
             nanoseconds=int(metadata.get("stamp_nsec", 0)),
@@ -439,20 +464,6 @@ class StereoZmqBridge(Node):
         depth_message.header.stamp = stamp
         depth_message.header.frame_id = frame_id
         self.depth_publisher.publish(depth_message)
-
-        disparity_image = self.cv_bridge.cv2_to_imgmsg(
-            disparity, encoding="32FC1"
-        )
-        disparity_image.header = depth_message.header
-        disparity_message = DisparityImage()
-        disparity_message.header = depth_message.header
-        disparity_message.image = disparity_image
-        disparity_message.f = float(metadata["fx"])
-        disparity_message.t = float(metadata["baseline"])
-        disparity_message.min_disparity = float(metadata.get("min_disparity", 0.0))
-        disparity_message.max_disparity = float(metadata.get("max_disparity", 0.0))
-        disparity_message.delta_d = 0.0
-        self.disparity_publisher.publish(disparity_message)
 
         if self.left_info is not None:
             info_message = copy.deepcopy(self.left_info)
@@ -482,10 +493,12 @@ class StereoZmqBridge(Node):
             self.point_cloud_publisher.publish(cloud)
 
     def destroy_node(self):
+        self._stop_event.set()
+        if self._result_thread.is_alive():
+            self._result_thread.join(timeout=2.0)
         with self._socket_lock:
             self.image_socket.close(linger=0)
-        self.result_socket.close(linger=0)
-        super().destroy_node()
+        return super().destroy_node()
 
 
 def main(args=None):

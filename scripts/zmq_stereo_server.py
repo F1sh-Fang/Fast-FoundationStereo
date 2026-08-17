@@ -3,7 +3,7 @@
 
 This process is intentionally ROS-free and is meant to run inside the GPU
 container.  A ROS 2 bridge on the host publishes rectified stereo frames over
-ZMQ; this server returns disparity (pixels) and metric depth (metres).
+ZMQ; this server returns metric depth in metres.
 """
 
 import argparse
@@ -260,24 +260,26 @@ def make_runner(args):
 
 def recv_latest(socket):
     """Receive one request and drain queued frames, keeping the newest."""
-    parts = socket.recv_multipart()
+    parts = socket.recv_multipart(copy=False)
     while True:
         try:
-            parts = socket.recv_multipart(flags=zmq.NOBLOCK)
+            parts = socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
         except zmq.Again:
             break
     if len(parts) != 3:
         raise ValueError(f"Expected 3 message parts, received {len(parts)}")
-    metadata = json.loads(parts[0].decode("utf-8"))
-    left = np.frombuffer(parts[1], dtype=np.dtype(metadata["left_dtype"]))
-    right = np.frombuffer(parts[2], dtype=np.dtype(metadata["right_dtype"]))
-    left = left.reshape(metadata["left_shape"]).copy()
-    right = right.reshape(metadata["right_shape"]).copy()
+    metadata = json.loads(bytes(parts[0]))
+    left = np.frombuffer(
+        parts[1].buffer, dtype=np.dtype(metadata["left_dtype"])
+    ).reshape(metadata["left_shape"])
+    right = np.frombuffer(
+        parts[2].buffer, dtype=np.dtype(metadata["right_dtype"])
+    ).reshape(metadata["right_shape"])
     return metadata, left, right
 
 
 def disparity_to_depth(disparity, fx, baseline, zmin, zmax, remove_invisible):
-    disparity = disparity.astype(np.float32, copy=True)
+    disparity = disparity.astype(np.float32, copy=False)
     valid = np.isfinite(disparity) & (disparity > 1e-6)
     if remove_invisible:
         x_coordinates = np.arange(disparity.shape[1], dtype=np.float32)[None, :]
@@ -287,8 +289,7 @@ def disparity_to_depth(disparity, fx, baseline, zmin, zmax, remove_invisible):
     depth[valid] = float(fx) * float(baseline) / disparity[valid]
     valid &= (depth >= zmin) & (depth <= zmax) & np.isfinite(depth)
     depth[~valid] = 0.0
-    disparity[~valid] = 0.0
-    return disparity, depth
+    return depth
 
 
 def parse_args():
@@ -411,7 +412,7 @@ def main():
                 disparity = _resize_disparity_to_input(
                     disparity, input_width, input_height
                 )
-                disparity, depth = disparity_to_depth(
+                depth = disparity_to_depth(
                     disparity,
                     fx,
                     baseline,
@@ -425,25 +426,24 @@ def main():
                     "stamp_nsec": metadata.get("stamp_nsec", 0),
                     "sequence": metadata.get("sequence", 0),
                     "frame_id": metadata.get("frame_id", ""),
-                    "shape": list(disparity.shape),
-                    "dtype": str(disparity.dtype),
+                    "shape": list(depth.shape),
+                    "dtype": str(depth.dtype),
                     "fx": fx,
                     "fy": float(metadata["fy"]),
                     "cx": float(metadata["cx"]),
                     "cy": float(metadata["cy"]),
                     "baseline": baseline,
-                    "min_disparity": 0.0,
-                    "max_disparity": float(runner.max_disp),
                     "inference_ms": inference_ms,
                 }
+                depth = np.ascontiguousarray(depth)
                 try:
                     result_socket.send_multipart(
                         [
                             json.dumps(response).encode("utf-8"),
-                            np.ascontiguousarray(disparity).tobytes(),
-                            np.ascontiguousarray(depth).tobytes(),
+                            memoryview(depth),
                         ],
                         flags=zmq.NOBLOCK,
+                        copy=False,
                     )
                 except zmq.Again:
                     pass
