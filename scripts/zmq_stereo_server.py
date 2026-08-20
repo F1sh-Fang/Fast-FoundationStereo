@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -258,14 +259,8 @@ def make_runner(args):
     )
 
 
-def recv_latest(socket):
-    """Receive one request and drain queued frames, keeping the newest."""
-    parts = socket.recv_multipart(copy=False)
-    while True:
-        try:
-            parts = socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
-        except zmq.Again:
-            break
+def decode_request(parts):
+    """Decode one complete stereo multipart request without copying images."""
     if len(parts) != 3:
         raise ValueError(f"Expected 3 message parts, received {len(parts)}")
     metadata = json.loads(bytes(parts[0]))
@@ -276,6 +271,70 @@ def recv_latest(socket):
         parts[2].buffer, dtype=np.dtype(metadata["right_dtype"])
     ).reshape(metadata["right_shape"])
     return metadata, left, right
+
+
+class LatestStereoInbox:
+    """Receive while inference runs and atomically retain one stereo pair."""
+
+    def __init__(self, socket):
+        self.socket = socket
+        self._condition = threading.Condition()
+        self._latest = None
+        self._stopped = False
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._receive_loop,
+            name="foundationstereo_image_receiver",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _receive_loop(self):
+        poller = zmq.Poller()
+        poller.register(self.socket, zmq.POLLIN)
+        try:
+            while True:
+                with self._condition:
+                    if self._stopped:
+                        return
+                events = dict(poller.poll(timeout=100))
+                if self.socket not in events:
+                    continue
+                parts = self.socket.recv_multipart(copy=False)
+                while True:
+                    try:
+                        parts = self.socket.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False
+                        )
+                    except zmq.Again:
+                        break
+                with self._condition:
+                    self._latest = parts
+                    self._condition.notify()
+        except zmq.ZMQError as exc:
+            with self._condition:
+                if not self._stopped:
+                    self._error = exc
+                    self._stopped = True
+                    self._condition.notify_all()
+        finally:
+            poller.unregister(self.socket)
+
+    def get(self):
+        with self._condition:
+            while self._latest is None and not self._stopped:
+                self._condition.wait()
+            if self._error is not None:
+                raise RuntimeError("stereo receive thread failed") from self._error
+            parts = self._latest
+            self._latest = None
+            return parts
+
+    def stop(self):
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._thread.join(timeout=1.0)
 
 
 def disparity_to_depth(disparity, fx, baseline, zmin, zmax, remove_invisible):
@@ -373,9 +432,10 @@ def main():
         )
     context = zmq.Context.instance()
     image_socket = context.socket(zmq.SUB)
-    image_socket.setsockopt(zmq.RCVHWM, 2)
+    image_socket.setsockopt(zmq.RCVHWM, 1)
     image_socket.connect(f"tcp://{args.host_ip}:{args.image_port}")
     image_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    image_inbox = LatestStereoInbox(image_socket)
     result_socket = context.socket(zmq.PUB)
     result_socket.setsockopt(zmq.SNDHWM, 2)
     result_socket.bind(f"tcp://0.0.0.0:{args.result_port}")
@@ -392,7 +452,10 @@ def main():
     try:
         while True:
             try:
-                metadata, left_raw, right_raw = recv_latest(image_socket)
+                parts = image_inbox.get()
+                if parts is None:
+                    break
+                metadata, left_raw, right_raw = decode_request(parts)
                 if left_raw.shape[:2] != right_raw.shape[:2]:
                     raise ValueError(
                         f"Stereo sizes differ: {left_raw.shape} vs {right_raw.shape}"
@@ -464,6 +527,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        image_inbox.stop()
         image_socket.close(linger=0)
         result_socket.close(linger=0)
 

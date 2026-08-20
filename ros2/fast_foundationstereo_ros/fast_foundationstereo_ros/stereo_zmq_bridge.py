@@ -195,7 +195,9 @@ class StereoZmqBridge(Node):
 
         context = zmq.Context.instance()
         self.image_socket = context.socket(zmq.PUB)
-        self.image_socket.setsockopt(zmq.SNDHWM, 2)
+        # The FFS server has a continuous receive thread and keeps one latest
+        # complete stereo pair.  Bound the transport queue to one frame.
+        self.image_socket.setsockopt(zmq.SNDHWM, 1)
         self.image_socket.setsockopt(zmq.LINGER, 0)
         self.image_socket.bind(self._parameter("image_endpoint"))
         self._result_endpoint = self._parameter("result_endpoint")
